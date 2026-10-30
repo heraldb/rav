@@ -37,12 +37,11 @@ export function humanizeDate(iso: string): string {
   }
 
   // Older — show normal date
-  return date.toLocaleString("en-US", {
+  return date.toLocaleString(undefined, {
     month: "short",
     day: "numeric",
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
-    hour12: true,
   });
 }
