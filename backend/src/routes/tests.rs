@@ -1920,6 +1920,88 @@
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Whether the body text "Hello plain text" of INBOX/42 is in the index.
+    fn body_indexed(data_dir: &str, user_hash: &str) -> bool {
+        let index = test_search_engine(data_dir).open_user_index(user_hash).unwrap();
+        let (results, _) = index
+            .search(&crate::search::engine::SearchQuery { text: "plain".into(), limit: 10, ..Default::default() })
+            .unwrap();
+        results.iter().any(|r| r.folder == "INBOX" && r.uid == 42)
+    }
+
+    #[tokio::test]
+    async fn get_message_indexes_a_fetched_body_but_not_a_cached_one() {
+        let static_dir = setup_static_dir();
+        let data_dir = TempDir::new().unwrap();
+        let data_path = data_dir.path().to_str().unwrap().to_string();
+        let config = test_config_with_imap(static_dir.path().to_str().unwrap(), &data_path);
+        let store = test_store();
+        let (browser_id, account_id, token) = setup_test_account(&store, "alice@example.com");
+        let inbox_id = crate::folder_cipher::FolderCipher::from_session_token(&token).encrypt("INBOX");
+        let user_hash = crate::auth::user_data::hash_email("alice@example.com");
+        provision_user_db(&data_path, &user_hash);
+
+        let mock = MockImapClient::new()
+            .with_headers(vec![ImapMessageHeader {
+                uid: 42,
+                subject: Some("Test Subject".to_string()),
+                from: vec![EmailAddress { name: None, address: "alice@example.com".to_string() }],
+                to: vec![],
+                date: Some("2024-01-01T10:00:00Z".to_string()),
+                date_epoch: 0,
+                flags: vec![],
+                has_attachments: false,
+                size: 1024,
+                message_id: None,
+                in_reply_to: None,
+                references: None,
+                cc: vec![],
+                reaction: None,
+            }])
+            .with_bodies(vec![ImapMessageBody {
+                uid: 42,
+                text_plain: Some("Hello plain text".to_string()),
+                text_html: None,
+                attachments: vec![],
+                raw_headers: String::new(),
+                pgp_status: None,
+            }]);
+        let imap_client: Arc<dyn ImapClient> = Arc::new(mock);
+        let app = create_router(AppServices { config, store, imap_client, search_engine: test_search_engine(&data_path), db_pool_manager: test_db_pool_manager(&data_path), ..test_services("/tmp") });
+
+        let get = |uri: String| {
+            let mut req = Request::builder().uri(uri).header("x-requested-with", "XMLHttpRequest");
+            for (name, value) in auth_headers(&browser_id, &account_id, &token) {
+                req = req.header(name, value);
+            }
+            req.body(Body::empty()).unwrap()
+        };
+
+        // Cache the header, then open the message: its body is fetched from IMAP.
+        let response = app.clone().oneshot(get(format!("/api/folders/{inbox_id}/messages"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(get(format!("/api/messages/{inbox_id}/42"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Indexing runs in the background; wait for it.
+        let mut indexed = false;
+        for _ in 0..100 {
+            if body_indexed(&data_path, &user_hash) {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(indexed, "a freshly fetched body must be indexed");
+
+        // Opening it again serves the cached body and must not index again.
+        test_search_engine(&data_path).open_user_index(&user_hash).unwrap().delete_message(42, "INBOX").unwrap();
+        let response = app.oneshot(get(format!("/api/messages/{inbox_id}/42"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!body_indexed(&data_path, &user_hash), "a cached body must not be indexed again");
+    }
+
     // -----------------------------------------------------------------------
     // Attachment download tests
     // -----------------------------------------------------------------------
