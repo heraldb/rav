@@ -127,15 +127,16 @@ pub(crate) async fn run_sync(ctx: SyncCtx<'_>) -> Result<(), String> {
         // ── Gap fill: older messages missing from the cache ──────────
         // Tiers 2/3 only fetch mail newer than the cache, so an interrupted
         // first load would otherwise leave the folder incomplete for good.
-        // Only for folders that have been loaded at least once (cached > 0),
-        // so never-opened folders aren't downloaded in the background.
+        // This also loads folders the user never opened (nothing cached),
+        // newest first and in bounded batches, so search covers every folder
+        // without one large download per folder.
         let cached_count = db::pool::with_user_db(db_pool_manager, user_hash, {
             let folder_name = folder_name.clone();
             move |conn| Ok(db::messages::count_messages(conn, &folder_name).unwrap_or(0))
         })
         .await
         .map_err(|e| format!("DB error: {e}"))?;
-        if cached_count > 0 && status.exists > cached_count && backfill_missing(ctx, folder_name).await? {
+        if status.exists > cached_count && backfill_missing(ctx, folder_name).await? {
             any_changes = true;
         }
     }
@@ -695,13 +696,18 @@ async fn sync_full(
     .await
     .map_err(|e| format!("DB error: {e}"))?;
 
+    // Nothing cached (a folder the user never opened): there is nothing to
+    // reconcile; the gap fill in `run_sync` loads it in batches. Only record
+    // the server's counts. Marking the empty cache fresh made the next open
+    // show an empty folder and the folder list recount its unread messages
+    // from the empty cache; storing the modseq sent the next sync down the
+    // CONDSTORE path, which downloaded the whole folder in one fetch.
     if cached.is_empty() {
         let _ = db::pool::with_user_db(db_pool_manager, user_hash, {
             let folder_name = folder_name.to_string();
             let uid_validity = status.uid_validity;
             let exists = status.exists;
-            let highest_modseq = status.highest_modseq;
-            move |conn| db::folders::update_folder_sync_status(conn, &folder_name, uid_validity, exists, highest_modseq)
+            move |conn| db::folders::update_folder_server_counts(conn, &folder_name, uid_validity, exists)
         })
         .await;
         return Ok(false);
@@ -954,10 +960,11 @@ mod tests {
         assert!(!bad.has_attachments, "basic fetch has no BODYSTRUCTURE, so no attachment flag");
     }
 
-    /// Folders the user never opened (nothing cached) are not downloaded in
-    /// the background.
+    /// Folders the user never opened (nothing cached) are loaded in the
+    /// background like any other gap: newest first, at most
+    /// BACKFILL_MAX_PER_CYCLE per cycle, the rest on the next cycles.
     #[tokio::test]
-    async fn sync_does_not_backfill_never_loaded_folders() {
+    async fn sync_loads_never_opened_folders_in_batches() {
         let data_dir = TempDir::new().unwrap();
         let user_hash = crate::auth::user_data::hash_email("alice@example.com");
         crate::auth::user_data::provision_user_data(data_dir.path().to_str().unwrap(), &user_hash).unwrap();
@@ -971,17 +978,27 @@ mod tests {
         let event_bus = Arc::new(EventBus::new());
         let search_engine = Arc::new(crate::search::engine::SearchEngine::new(data_dir.path().to_path_buf()));
 
-        let mock = MockImapClient::new().with_headers((1..=10).map(|uid| new_header(uid, "Mail", "Dave")).collect());
+        let total = BACKFILL_MAX_PER_CYCLE as u32 + 200;
+        let mock = MockImapClient::new().with_headers((1..=total).map(|uid| new_header(uid, "Mail", "Dave")).collect());
         let imap_client: Arc<dyn ImapClient> = Arc::new(mock);
+        let cached = || async {
+            db::pool::with_user_db(&db_pool_manager, &user_hash, |conn| {
+                let uids: Vec<u32> = db::messages::get_all_uids_and_flags(conn, "INBOX")?.into_iter().map(|(uid, _)| uid).collect();
+                Ok((uids.len() as u32, uids.iter().copied().min().unwrap_or(0)))
+            })
+            .await
+            .unwrap()
+        };
 
         run_sync(SyncCtx { user_hash: &user_hash, creds: &creds, imap_client: imap_client.as_ref(), event_bus: &event_bus, search_engine: &search_engine, db_pool_manager: &db_pool_manager })
             .await
             .expect("sync should succeed");
+        assert_eq!(cached().await, (BACKFILL_MAX_PER_CYCLE as u32, 201), "first cycle: the newest messages, one bounded batch");
 
-        let count = db::pool::with_user_db(&db_pool_manager, &user_hash, |conn| db::messages::count_messages(conn, "INBOX"))
+        run_sync(SyncCtx { user_hash: &user_hash, creds: &creds, imap_client: imap_client.as_ref(), event_bus: &event_bus, search_engine: &search_engine, db_pool_manager: &db_pool_manager })
             .await
-            .unwrap();
-        assert_eq!(count, 0);
+            .expect("sync should succeed");
+        assert_eq!(cached().await, (total, 1), "next cycle: the rest");
     }
 
     /// Full-scan tier (no CONDSTORE support cached): a genuinely new message
@@ -1073,5 +1090,45 @@ mod tests {
             }
         }
         assert!(saw_real_new_messages, "expected a FolderStateChanged event for the new message");
+    }
+
+    /// A full scan of a folder with nothing cached must not mark that empty
+    /// cache fresh (the next open would show an empty folder and the folder
+    /// list would recount unread from it), nor store the modseq (the next sync
+    /// would take the CONDSTORE path and fetch the whole folder at once).
+    #[tokio::test]
+    async fn sync_full_leaves_an_empty_cache_unmarked() {
+        let data_dir = TempDir::new().unwrap();
+        let user_hash = seed_user_with_one_message(data_dir.path(), 5).await;
+        let db_pool_manager = test_db_pool_manager(data_dir.path());
+        db::pool::with_user_db(&db_pool_manager, &user_hash, |conn| {
+            db::folders::upsert_folder(conn, UpsertFolderParams { name: "Archive", delimiter: None, parent: None, flags_csv: "", is_subscribed: true, total_count: 0, unread_count: 2, uid_validity: 1, highest_modseq: 0 })
+        })
+        .await
+        .unwrap();
+        let creds = test_creds();
+        let event_bus = Arc::new(EventBus::new());
+        let search_engine = Arc::new(crate::search::engine::SearchEngine::new(data_dir.path().to_path_buf()));
+        let imap_client = MockImapClient::new();
+        let status = FolderStatusExtended { uid_validity: 1, exists: 3, uid_next: 4, unseen: 2, highest_modseq: 9 };
+
+        let changed = sync_full(SyncCtx { user_hash: &user_hash, creds: &creds, imap_client: &imap_client, event_bus: &event_bus, search_engine: &search_engine, db_pool_manager: &db_pool_manager }, "Archive", &status)
+            .await
+            .expect("sync should succeed");
+        assert!(!changed);
+
+        let (fresh, invalidated, folder) = db::pool::with_user_db(&db_pool_manager, &user_hash, |conn| {
+            Ok((
+                db::folders::is_folder_fresh(conn, "Archive", 30)?,
+                db::folders::is_folder_messages_invalidated(conn, "Archive")?,
+                db::folders::get_folder(conn, "Archive")?.unwrap(),
+            ))
+        })
+        .await
+        .unwrap();
+        assert!(!fresh, "an empty cache must not be marked fresh");
+        assert!(invalidated, "the folder list must keep the server's unread count");
+        assert_eq!(folder.highest_modseq, 0, "storing the modseq would lead to a one-shot download");
+        assert_eq!(folder.total_count, 3, "the server's count is still recorded");
     }
 }
