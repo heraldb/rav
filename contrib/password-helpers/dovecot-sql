@@ -17,22 +17,22 @@
 #                    WHERE username = '%n' AND active=1
 #   - '%n' is the local part of the login, so the domain is stripped here too.
 #   - The hash is stored as {SHA512-CRYPT}$6$..., the prefix makes Dovecot
-#     ignore default_pass_scheme for this row, so old SHA512 hex hashes
-#     written by Roundcube keep working side by side.
+#     ignore default_pass_scheme for this row, so hashes in an older scheme
+#     keep working side by side.
 #
 # Database credentials come from a MariaDB option file passed by systemd:
 #   /etc/rav/passwd-db.cnf (root:root 0600):
 #     [client]
-#     user=rav_passwd
+#     user=<helper db user>
 #     password=...
-#     database=mail
+#     database=<mail db>
 #   systemd drop-in for rav.service:
 #     [Service]
 #     LoadCredential=rav-passwd-db:/etc/rav/passwd-db.cnf
 #   Least-privilege database user:
-#     CREATE USER 'rav_passwd'@'localhost' IDENTIFIED BY '...';
+#     CREATE USER '<helper db user>'@'localhost' IDENTIFIED BY '...';
 #     GRANT SELECT (username, active), UPDATE (password)
-#       ON mail.users TO 'rav_passwd'@'localhost';
+#       ON <mail db>.users TO '<helper db user>'@'localhost';
 
 set -euo pipefail
 umask 077
