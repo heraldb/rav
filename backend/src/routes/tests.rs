@@ -1848,6 +1848,60 @@
         assert_eq!(body.as_ref(), &attachment_data);
     }
 
+    /// Download attachment 0 of INBOX/42, sent as application/octet-stream
+    /// with the given name and data. Returns (content-type, content-disposition).
+    async fn download_octet_stream(filename: &str, data: &[u8]) -> (String, String) {
+        let static_dir = setup_static_dir();
+        let data_dir = TempDir::new().unwrap();
+        let config = test_config_with_imap(static_dir.path().to_str().unwrap(), data_dir.path().to_str().unwrap());
+        let store = test_store();
+        let (browser_id, account_id, token) = setup_test_account(&store, "alice@example.com");
+        let inbox_id = crate::folder_cipher::FolderCipher::from_session_token(&token).encrypt("INBOX");
+        provision_user_db(data_dir.path().to_str().unwrap(), &crate::auth::user_data::hash_email("alice@example.com"));
+
+        let mock = MockImapClient::new().with_bodies(vec![ImapMessageBody {
+            uid: 42,
+            text_plain: Some("text".to_string()),
+            text_html: None,
+            attachments: vec![ImapAttachment {
+                filename: Some(filename.to_string()),
+                content_type: "application/octet-stream".to_string(),
+                size: data.len(),
+                data: data.to_vec(),
+                content_id: None,
+            }],
+            raw_headers: String::new(),
+            pgp_status: None,
+        }]);
+        let imap_client: Arc<dyn ImapClient> = Arc::new(mock);
+        let app = create_router(AppServices { config, store, imap_client, search_engine: test_search_engine(data_dir.path().to_str().unwrap()), db_pool_manager: test_db_pool_manager(data_dir.path().to_str().unwrap()), ..test_services("/tmp") });
+
+        let mut req = Request::builder()
+            .uri(format!("/api/messages/{inbox_id}/42/attachments/0"))
+            .header("x-requested-with", "XMLHttpRequest");
+        for (name, value) in auth_headers(&browser_id, &account_id, &token) {
+            req = req.header(name, value);
+        }
+        let response = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = |name: &str| response.headers().get(name).unwrap().to_str().unwrap().to_string();
+        (header("content-type"), header("content-disposition"))
+    }
+
+    #[tokio::test]
+    async fn download_attachment_serves_octet_stream_pdf_as_pdf() {
+        let (content_type, disposition) = download_octet_stream("scan.pdf", b"%PDF-1.4 fake").await;
+        assert_eq!(content_type, "application/pdf");
+        assert!(disposition.starts_with("inline"), "{disposition}");
+    }
+
+    #[tokio::test]
+    async fn download_attachment_keeps_octet_stream_when_data_is_no_pdf() {
+        let (content_type, disposition) = download_octet_stream("scan.pdf", b"MZ\x90\0not a pdf").await;
+        assert_eq!(content_type, "application/octet-stream");
+        assert!(disposition.starts_with("attachment"), "{disposition}");
+    }
+
     #[tokio::test]
     async fn download_attachment_strips_control_chars_from_filename() {
         // MIME decoders can surface control characters in attachment filenames
