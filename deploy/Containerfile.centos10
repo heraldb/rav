@@ -1,0 +1,56 @@
+# =============================================================================
+# Rav — native build for CentOS Stream 10 (build-only, no runtime image)
+# =============================================================================
+# Produces the backend binary linked against CentOS Stream 10's glibc and
+# OpenSSL, plus the static frontend export. Used by deploy/build-native.sh:
+#   podman build -f deploy/Containerfile.centos10 -o type=local,dest=dist .
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1 — Frontend build (static export, platform-independent)
+# ---------------------------------------------------------------------------
+FROM docker.io/library/node:24-bookworm-slim AS frontend-build
+
+ARG NEXT_PUBLIC_BASE_PATH
+ENV NEXT_PUBLIC_BASE_PATH=${NEXT_PUBLIC_BASE_PATH}
+
+WORKDIR /app/frontend
+
+RUN npm install -g bun
+
+COPY frontend/package.json frontend/bun.lock ./
+RUN bun install
+
+COPY frontend/ .
+RUN if [ -f public/stickers/manifest.json ]; then export NEXT_PUBLIC_FEATURE_STICKERS=true; else export NEXT_PUBLIC_FEATURE_STICKERS=false; fi && bun run build
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Backend build on CentOS Stream 10 (matches the VPS glibc/OpenSSL)
+# ---------------------------------------------------------------------------
+FROM quay.io/centos/centos:stream10 AS backend-build
+
+RUN dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
+    && dnf clean all
+
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
+WORKDIR /app/backend
+
+# Dependency caching layer (see top-level Dockerfile for rationale)
+COPY backend/Cargo.toml backend/Cargo.lock backend/rust-toolchain.toml ./
+COPY backend/migrations/ migrations/
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release \
+    && rm -rf src
+
+COPY backend/src/ src/
+RUN touch src/main.rs && cargo build --release && strip target/release/rav-email-server
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Export: only the files to install on the VPS
+# ---------------------------------------------------------------------------
+FROM scratch AS export
+
+COPY --from=backend-build /app/backend/target/release/rav-email-server /rav/rav-email-server
+COPY --from=frontend-build /app/frontend/out /rav/static

@@ -1,0 +1,16 @@
+# Branches merged into the `vps` branch by deploy/refresh-vps-branch.sh,
+# in this order, on top of BASE. Remove a branch once upstream has merged it
+# (merging it again is harmless, just redundant).
+BASE origin/main
+
+local/deploy
+fix/smtp-permanent-rejection-no-retry
+fix/folder-backfill-unparseable-bodystructure
+feat/password-change
+fix/sign-out-single-account
+fix/passkey-prf-extension
+fix/email-iframe-no-referrer
+fix/locale-aware-dates
+feat/log-failed-logins
+fix/idle-last-socket-stops
+fix/ws-resume-recovery

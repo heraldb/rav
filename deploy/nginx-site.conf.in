@@ -1,0 +1,64 @@
+# =============================================================================
+# Rav — nginx server block (/etc/nginx/conf.d/${RAV_DOMAIN}.conf)
+# =============================================================================
+# HTTP only to start with. Running
+#   certbot --nginx -d ${RAV_DOMAIN}
+# adds the listen 443 ssl / certificate lines and the HTTP -> HTTPS redirect.
+# =============================================================================
+
+map $http_upgrade $rav_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# Rav sends no Cache-Control, so browsers guess and keep stale pages after an
+# upgrade. Build assets have hashed names and never change; pages and their
+# .txt (RSC) payloads must be revalidated. The API sets its own headers.
+map $uri $rav_cache_control {
+    ~^/api/          "";
+    ~^/_next/static/ "public, max-age=31536000, immutable";
+    default          "no-cache";
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${RAV_DOMAIN};
+
+    # Attachments are uploaded through the API
+    client_max_body_size 50m;
+
+    access_log /var/log/nginx/${RAV_DOMAIN}.access.log;
+    error_log  /var/log/nginx/${RAV_DOMAIN}.error.log;
+
+    location / {
+        proxy_pass http://127.0.0.1:${RAV_PORT};
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 120s;
+
+        add_header Cache-Control $rav_cache_control always;
+    }
+
+    # Real-time updates (WebSocket)
+    location = /api/ws {
+        proxy_pass http://127.0.0.1:${RAV_PORT};
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $rav_connection_upgrade;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_buffering off;
+    }
+}
