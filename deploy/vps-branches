@@ -17,3 +17,8 @@ fix/ws-resume-recovery
 fix/search-index-on-move-delete
 fix/skip-signature-only-drafts
 fix/signature-switch-after-edit
+fix/sync-dont-mark-empty-folders-fresh
+fix/index-message-body-once
+fix/folder-click-clears-search
+fix/preview-pdf-sent-as-octet-stream
+fix/search-input-name
