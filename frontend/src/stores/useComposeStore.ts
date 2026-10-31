@@ -149,9 +149,9 @@ function visibleContent(html: string): { text: string; images: string } {
 /**
  * Whether the body holds anything beyond the automatic signature.
  *
- * The editor rewrites the injected signature (it drops the wrapper div and
- * the delimiter's trailing space), so this compares visible text and images
- * rather than markup. Any change to the signature's text counts as content.
+ * The editor rewrites the injected signature markup (it drops the
+ * delimiter's trailing space, for one), so this compares visible text and
+ * images rather than markup. Any change to the signature's text counts as content.
  * A plain-text body is the signature's text without its images.
  */
 export function bodyHasContent(body: string, signatureHtml: string, isHtml = true): boolean {
