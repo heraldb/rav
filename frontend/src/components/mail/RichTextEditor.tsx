@@ -7,6 +7,7 @@ import Link from "@tiptap/extension-link";
 import Image from "@tiptap/extension-image";
 import Placeholder from "@tiptap/extension-placeholder";
 import Underline from "@tiptap/extension-underline";
+import { SignatureNode } from "./SignatureNode";
 import {
   Bold,
   Italic,
@@ -94,6 +95,7 @@ export function RichTextEditor({
         placeholder,
       }),
       Underline,
+      SignatureNode,
     ],
     content,
     onUpdate: ({ editor }) => {
