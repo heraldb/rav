@@ -137,6 +137,32 @@ export function removeSignatureFromBody(body: string): string {
   return body.replace(/<div class="email-signature"[^>]*>[\s\S]*?<\/div>/, "");
 }
 
+/** Visible text (without whitespace) and image sources of an HTML fragment. */
+function visibleContent(html: string): { text: string; images: string } {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return {
+    text: (doc.body.textContent ?? "").replace(/\s+/g, ""),
+    images: Array.from(doc.body.querySelectorAll("img"), (img) => img.getAttribute("src") ?? "").join("\n"),
+  };
+}
+
+/**
+ * Whether the body holds anything beyond the automatic signature.
+ *
+ * The editor rewrites the injected signature (it drops the wrapper div and
+ * the delimiter's trailing space), so this compares visible text and images
+ * rather than markup. Any change to the signature's text counts as content.
+ * A plain-text body is the signature's text without its images.
+ */
+export function bodyHasContent(body: string, signatureHtml: string, isHtml = true): boolean {
+  const content = isHtml ? visibleContent(body) : { text: body.replace(/\s+/g, ""), images: "" };
+  if (!content.text && !content.images) return false;
+  if (!signatureHtml) return true;
+  const signature = visibleContent(wrapSignatureHtml(signatureHtml));
+  if (!isHtml) return content.text !== signature.text;
+  return content.text !== signature.text || content.images !== signature.images;
+}
+
 const initialState = {
   isOpen: false,
   mode: "new" as "new" | "reply" | "forward",

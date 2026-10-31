@@ -27,6 +27,7 @@ import {
   replaceSignatureInBody,
   removeSignatureFromBody,
   injectSignature,
+  bodyHasContent,
 } from "@/stores/useComposeStore";
 import {
   useEnqueueOutbox,
@@ -140,16 +141,17 @@ export function ComposeDialog() {
   const sendFeedbackMotionProps = useMemo(() => createFadeSlideVariants(effectiveAnimationMode, "y"), [effectiveAnimationMode]);
   const serializedSendFeedbackMotionProps = useMemo(() => JSON.stringify(sendFeedbackMotionProps), [sendFeedbackMotionProps]);
 
+  // An untouched automatic signature alone is not worth saving as a draft.
   const hasContent = useCallback(() => {
     return !!(
       to.trim() ||
       cc.trim() ||
       bcc.trim() ||
       subject.trim() ||
-      stripHtml(body).trim() ||
-      attachments.length > 0
+      attachments.length > 0 ||
+      bodyHasContent(body, signatureHtml, isHtml)
     );
-  }, [to, cc, bcc, subject, body, attachments]);
+  }, [to, cc, bcc, subject, body, attachments, signatureHtml, isHtml]);
 
   // Auto-select the default identity when dialog opens and no identity is set,
   // and inject signature into body
@@ -201,14 +203,7 @@ export function ComposeDialog() {
       const hash = computeHash();
       // Don't save if nothing changed (unless forced) or compose is empty
       if (!force && hash === lastSavedHashRef.current) return;
-      if (
-        !to.trim() &&
-        !cc.trim() &&
-        !bcc.trim() &&
-        !subject.trim() &&
-        !stripHtml(body).trim()
-      )
-        return;
+      if (!hasContent()) return;
 
       let currentDraftId = draftId;
       if (!currentDraftId) {
@@ -244,6 +239,7 @@ export function ComposeDialog() {
     },
     [
       computeHash,
+      hasContent,
       to,
       cc,
       bcc,
