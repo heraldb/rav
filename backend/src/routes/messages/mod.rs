@@ -628,7 +628,7 @@ pub async fn get_message(
                 .map(|(i, a)| AttachmentMeta {
                     id: i.to_string(),
                     filename: a.filename.clone(),
-                    content_type: a.content_type.clone(),
+                    content_type: attachment_content_type(&a.content_type, a.filename.as_deref(), &a.data),
                     size: a.size,
                     content_id: a.content_id.clone(),
                 })
@@ -1134,6 +1134,20 @@ pub async fn bulk_move_messages(
     Ok(Json(BulkMessageOpResponse { failed_uids }).into_response())
 }
 
+/// The media type to present an attachment as.
+///
+/// Some mail programs send PDFs as `application/octet-stream`, or spell the
+/// type in another case; those are reported as `application/pdf` so they can
+/// be previewed. The filename alone is not trusted: the data must start with
+/// the PDF signature.
+fn attachment_content_type(content_type: &str, filename: Option<&str>, data: &[u8]) -> String {
+    let is_pdf = content_type.eq_ignore_ascii_case("application/pdf")
+        || (content_type.eq_ignore_ascii_case("application/octet-stream")
+            && filename.is_some_and(|name| name.to_ascii_lowercase().ends_with(".pdf"))
+            && data.starts_with(b"%PDF-"));
+    if is_pdf { "application/pdf".to_string() } else { content_type.to_string() }
+}
+
 /// `GET /api/messages/:folder/:uid/attachments/:attachment_id`
 ///
 /// Downloads an attachment by its index from the message.
@@ -1193,7 +1207,7 @@ pub async fn download_attachment(
     } else {
         filename
     };
-    let content_type = attachment.content_type;
+    let content_type = attachment_content_type(&attachment.content_type, Some(&filename), &attachment.data);
 
     // Use inline disposition for types the browser can display natively
     // (PDF, images) so the preview works; use attachment for everything else.
@@ -1339,4 +1353,27 @@ pub async fn mark_all_read(
     .map_err(|e| AppError::InternalError(format!("Database error: {e}")))?;
 
     Ok(Json(serde_json::json!({ "status": "ok" })).into_response())
+}
+
+#[cfg(test)]
+mod attachment_content_type_tests {
+    use super::attachment_content_type;
+
+    #[test]
+    fn normalizes_pdf_types() {
+        assert_eq!(attachment_content_type("Application/PDF", None, b""), "application/pdf");
+        assert_eq!(attachment_content_type("application/octet-stream", Some("Invoice.PDF"), b"%PDF-1.7"), "application/pdf");
+    }
+
+    #[test]
+    fn does_not_trust_the_filename_alone() {
+        assert_eq!(attachment_content_type("application/octet-stream", Some("invoice.pdf"), b"MZ\x90\0"), "application/octet-stream");
+        assert_eq!(attachment_content_type("application/octet-stream", Some("notes.txt"), b"%PDF-1.7"), "application/octet-stream");
+        assert_eq!(attachment_content_type("application/octet-stream", None, b"%PDF-1.7"), "application/octet-stream");
+    }
+
+    #[test]
+    fn leaves_other_types_alone() {
+        assert_eq!(attachment_content_type("image/png", Some("a.pdf"), b"%PDF-"), "image/png");
+    }
 }
