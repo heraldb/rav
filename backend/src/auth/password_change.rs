@@ -27,6 +27,11 @@ pub const MAX_PASSWORD_CHARS: usize = 1024;
 
 const HELPER_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Attempts to start the helper while the OS reports it busy, and the pause
+/// between them.
+const SPAWN_ATTEMPTS: u32 = 5;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
+
 /// Why a password change through the helper did not succeed.
 #[derive(Debug, PartialEq)]
 pub enum ChangeError {
@@ -75,9 +80,21 @@ pub async fn run_helper(
         cmd.env("CREDENTIALS_DIRECTORY", dir);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| ChangeError::Failed(format!("cannot start {command}: {e}")))?;
+    // Linux refuses to execute a file that any process still has open for
+    // writing ("Text file busy"). That happens briefly when the helper is
+    // being replaced, or when another thread forks while the file is written,
+    // so retry a few times before giving up.
+    let mut attempt = 1;
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < SPAWN_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(ChangeError::Failed(format!("cannot start {command}: {e}"))),
+        }
+    };
 
     let input = serde_json::json!({ "username": username, "new_password": new_password }).to_string();
 
@@ -221,6 +238,38 @@ mod tests {
         async fn missing_helper_fails() {
             let result = run_helper("/nonexistent/rav-passwd", "u", "p", TIMEOUT).await;
             assert!(matches!(result, Err(ChangeError::Failed(_))));
+        }
+
+        /// Open the helper for writing, as a concurrent writer or a forked
+        /// child holding an inherited descriptor would, so exec gets ETXTBSY.
+        fn hold_open_for_writing(path: &str) -> std::fs::File {
+            std::fs::OpenOptions::new().append(true).open(path).unwrap()
+        }
+
+        #[tokio::test]
+        async fn retries_while_helper_is_busy() {
+            let dir = TempDir::new().unwrap();
+            let helper = script(&dir, "cat >/dev/null; exit 0");
+            let writer = hold_open_for_writing(&helper);
+
+            let run = tokio::spawn(async move { run_helper(&helper, "u", "p", TIMEOUT).await });
+            // Long enough for the first attempt to fail, well within the retries.
+            tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+            drop(writer);
+
+            assert_eq!(run.await.unwrap(), Ok(()));
+        }
+
+        #[tokio::test]
+        async fn gives_up_when_helper_stays_busy() {
+            let dir = TempDir::new().unwrap();
+            let helper = script(&dir, "exit 0");
+            let _writer = hold_open_for_writing(&helper);
+
+            match run_helper(&helper, "u", "p", TIMEOUT).await {
+                Err(ChangeError::Failed(msg)) => assert!(msg.contains("cannot start"), "{msg}"),
+                other => panic!("expected Failed, got {other:?}"),
+            }
         }
 
         #[tokio::test]
