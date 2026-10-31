@@ -16,3 +16,4 @@ fix/idle-last-socket-stops
 fix/ws-resume-recovery
 fix/search-index-on-move-delete
 fix/skip-signature-only-drafts
+fix/signature-switch-after-edit
