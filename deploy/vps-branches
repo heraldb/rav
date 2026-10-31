@@ -14,3 +14,4 @@ fix/locale-aware-dates
 feat/log-failed-logins
 fix/idle-last-socket-stops
 fix/ws-resume-recovery
+fix/search-index-on-move-delete
