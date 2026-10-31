@@ -28,8 +28,9 @@ server {
     # Attachments are uploaded through the API
     client_max_body_size 50m;
 
-    access_log /var/log/nginx/${RAV_DOMAIN}.access.log;
-    error_log  /var/log/nginx/${RAV_DOMAIN}.error.log;
+    # Own directory under /var/log/nginx (created by install.sh)
+    access_log /var/log/nginx/rav/access.log;
+    error_log  /var/log/nginx/rav/error.log;
 
     location / {
         proxy_pass http://127.0.0.1:${RAV_PORT};

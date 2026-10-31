@@ -44,6 +44,11 @@ else
 fi
 systemctl daemon-reload
 
+# nginx log directory used by the site config; nginx's master process
+# (root) writes the logs. restorecon gives it the httpd_log_t context.
+install -d -m 0750 /var/log/nginx/rav
+restorecon /var/log/nginx/rav 2>/dev/null || true
+
 # nginx site: only on first install
 if [ ! -f "/etc/nginx/conf.d/${RAV_DOMAIN}.conf" ]; then
     install -m 0644 nginx-site.conf "/etc/nginx/conf.d/${RAV_DOMAIN}.conf"
