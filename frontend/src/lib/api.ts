@@ -37,10 +37,39 @@ function handleAccountSessionExpired(error: ApiError): void {
   }
 }
 
+let checkingSession = false;
+
+/**
+ * Leave a page whose login is gone for the login page.
+ *
+ * The server keeps sessions in memory, so a restart (e.g. a deploy) ends
+ * them all and every request then fails with 401. A 401 can also mean a
+ * wrong password (adding an account, changing the password), so ask the
+ * server whether this browser still has a session before leaving. The full
+ * page load also picks up a newly deployed frontend.
+ */
+function handleUnauthorized(status: number, error: ApiError): void {
+  if (status !== 401 || error.code === "ACCOUNT_SESSION_EXPIRED") return;
+  // Only while logged in: on the login page a 401 is a normal answer.
+  if (checkingSession || useAuthStore.getState().accounts.length === 0) return;
+  checkingSession = true;
+  fetchAccounts()
+    .then((data) => {
+      if (data.accounts.length === 0) {
+        window.location.assign(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/`);
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      checkingSession = false;
+    });
+}
+
 async function parseErrorResponse(res: Response): Promise<Error> {
   const data: ErrorResponse = await res.json();
   const error = data.error ?? {};
   handleAccountSessionExpired(error);
+  handleUnauthorized(res.status, error);
   return new Error(error.message ?? "An unexpected error occurred");
 }
 
