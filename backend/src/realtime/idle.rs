@@ -13,11 +13,18 @@ use crate::{db, imap};
 
 /// Manages long-lived IMAP IDLE connections, one per (user, folder) pair.
 ///
-/// When a WebSocket client connects, the IdleManager starts IDLE for INBOX.
-/// When the client disconnects, all IDLE tasks for that user are stopped.
+/// Each WebSocket subscribes to IDLE for INBOX of every account it serves.
+/// Sockets of the same user (several tabs, phone + desktop) share one IDLE
+/// task, which is only stopped when the last of them disconnects.
 pub struct IdleManager {
     /// Active IDLE tasks keyed by `(user_hash, folder_name)`.
-    tasks: DashMap<(String, String), JoinHandle<()>>,
+    tasks: DashMap<(String, String), IdleTask>,
+}
+
+struct IdleTask {
+    handle: JoinHandle<()>,
+    /// Number of WebSockets currently subscribed to this task.
+    subscribers: usize,
 }
 
 impl IdleManager {
@@ -27,8 +34,8 @@ impl IdleManager {
         }
     }
 
-    /// Start an IDLE task for a specific user + folder.
-    /// If one is already running, this is a no-op.
+    /// Subscribe to IDLE for a specific user + folder, sharing the task if
+    /// one is already running. Every call must be paired with `stop_idle`.
     pub async fn start_idle(
         &self,
         user_hash: String,
@@ -38,44 +45,49 @@ impl IdleManager {
         sync_worker_manager: Arc<crate::realtime::worker::SyncWorkerManager>,
     ) {
         let key = (user_hash.clone(), folder.clone());
-        if self.tasks.contains_key(&key) {
-            return;
-        }
-
-        let task_user_hash = user_hash.clone();
-        let task_folder = folder.clone();
-
-        let handle = tokio::spawn(async move {
-            idle_loop(
-                &task_user_hash, &task_folder, &creds,
-                &transport, sync_worker_manager,
-            ).await;
+        self.subscribe(key, move || {
+            tokio::spawn(async move {
+                idle_loop(
+                    &user_hash, &folder, &creds,
+                    &transport, sync_worker_manager,
+                ).await;
+            })
         });
-
-        self.tasks.insert(key, handle);
     }
 
-    /// Stop the IDLE task for a specific user + folder.
-    #[allow(dead_code)]
-    pub async fn stop_idle(&self, user_hash: &str, folder: &str) {
-        let key = (user_hash.to_string(), folder.to_string());
-        if let Some((_, handle)) = self.tasks.remove(&key) {
-            handle.abort();
+    fn subscribe(&self, key: (String, String), spawn: impl FnOnce() -> JoinHandle<()>) {
+        use dashmap::mapref::entry::Entry;
+
+        match self.tasks.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let task = entry.get_mut();
+                // idle_loop only returns if the session ended on its own;
+                // restart it rather than keep a dead task alive.
+                if task.handle.is_finished() {
+                    task.handle = spawn();
+                }
+                task.subscribers += 1;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(IdleTask {
+                    handle: spawn(),
+                    subscribers: 1,
+                });
+            }
         }
     }
 
-    /// Stop all IDLE tasks for a user (called on WebSocket disconnect).
-    pub async fn stop_all(&self, user_hash: &str) {
-        let keys_to_remove: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|entry| entry.key().0 == user_hash)
-            .map(|entry| entry.key().clone())
-            .collect();
+    /// Release one subscription for a specific user + folder. The IDLE task
+    /// is stopped when its last subscriber is gone.
+    pub async fn stop_idle(&self, user_hash: &str, folder: &str) {
+        use dashmap::mapref::entry::Entry;
 
-        for key in keys_to_remove {
-            if let Some((_, handle)) = self.tasks.remove(&key) {
-                handle.abort();
+        let key = (user_hash.to_string(), folder.to_string());
+        if let Entry::Occupied(mut entry) = self.tasks.entry(key) {
+            if entry.get().subscribers > 1 {
+                entry.get_mut().subscribers -= 1;
+            } else {
+                entry.remove().handle.abort();
             }
         }
     }
@@ -614,6 +626,70 @@ fn vacation_in_date_range(vacation: &db::vacation::VacationResponder, today: &st
 mod tests {
     use super::*;
     use crate::db::vacation::VacationResponder;
+
+    // --- IdleManager subscriptions ---
+
+    fn idle_forever() -> JoinHandle<()> {
+        tokio::spawn(std::future::pending())
+    }
+
+    fn key() -> (String, String) {
+        ("user".to_string(), "INBOX".to_string())
+    }
+
+    #[tokio::test]
+    async fn overlapping_sockets_share_one_task_until_last_disconnect() {
+        let manager = IdleManager::new();
+        let mut spawned = 0;
+        manager.subscribe(key(), || { spawned += 1; idle_forever() });
+        manager.subscribe(key(), || { spawned += 1; idle_forever() });
+        assert_eq!(spawned, 1, "second socket must reuse the running task");
+
+        manager.stop_idle("user", "INBOX").await;
+        let handle = manager.tasks.get(&key()).expect("task must survive first disconnect");
+        assert!(!handle.handle.is_finished());
+        drop(handle);
+
+        manager.stop_idle("user", "INBOX").await;
+        assert!(manager.tasks.get(&key()).is_none());
+    }
+
+    #[tokio::test]
+    async fn last_disconnect_aborts_the_task() {
+        let manager = IdleManager::new();
+        manager.subscribe(key(), idle_forever);
+        let probe = manager.tasks.get(&key()).unwrap().handle.abort_handle();
+
+        manager.stop_idle("user", "INBOX").await;
+        tokio::task::yield_now().await;
+        assert!(probe.is_finished());
+    }
+
+    #[tokio::test]
+    async fn finished_task_is_restarted_on_subscribe() {
+        let manager = IdleManager::new();
+        manager.subscribe(key(), || tokio::spawn(async {}));
+        while !manager.tasks.get(&key()).unwrap().handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let mut respawned = false;
+        manager.subscribe(key(), || { respawned = true; idle_forever() });
+        assert!(respawned);
+        assert_eq!(manager.tasks.get(&key()).unwrap().subscribers, 2);
+    }
+
+    #[tokio::test]
+    async fn users_are_independent() {
+        let manager = IdleManager::new();
+        manager.subscribe(key(), idle_forever);
+        manager.subscribe(("other".into(), "INBOX".into()), idle_forever);
+
+        manager.stop_idle("other", "INBOX").await;
+        assert!(manager.tasks.get(&key()).is_some());
+        // Stopping an unknown subscription is harmless.
+        manager.stop_idle("other", "INBOX").await;
+    }
 
     // --- is_automated_sender ---
 
