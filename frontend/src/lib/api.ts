@@ -43,15 +43,18 @@ let checkingSession = false;
  * Leave a page whose login is gone for the login page.
  *
  * The server keeps sessions in memory, so a restart (e.g. a deploy) ends
- * them all and every request then fails with 401. A 401 can also mean a
- * wrong password (adding an account, changing the password), so ask the
- * server whether this browser still has a session before leaving. The full
- * page load also picks up a newly deployed frontend.
+ * them all and every request then fails with 401: ACCOUNT_SESSION_EXPIRED
+ * while the browser still sends its session cookies, UNAUTHORIZED once they
+ * are gone. A 401 can also mean a wrong password (adding an account,
+ * changing the password), and an expired account may leave others that
+ * still work, so ask the server whether this browser still has a session
+ * before leaving. The full page load also picks up a newly deployed frontend.
+ *
+ * `wasLoggedIn` is taken before `handleAccountSessionExpired` removes the
+ * account: on the login page a 401 is a normal answer.
  */
-function handleUnauthorized(status: number, error: ApiError): void {
-  if (status !== 401 || error.code === "ACCOUNT_SESSION_EXPIRED") return;
-  // Only while logged in: on the login page a 401 is a normal answer.
-  if (checkingSession || useAuthStore.getState().accounts.length === 0) return;
+function handleUnauthorized(status: number, wasLoggedIn: boolean): void {
+  if (status !== 401 || !wasLoggedIn || checkingSession) return;
   checkingSession = true;
   fetchAccounts()
     .then((data) => {
@@ -68,8 +71,9 @@ function handleUnauthorized(status: number, error: ApiError): void {
 async function parseErrorResponse(res: Response): Promise<Error> {
   const data: ErrorResponse = await res.json();
   const error = data.error ?? {};
+  const wasLoggedIn = useAuthStore.getState().accounts.length > 0;
   handleAccountSessionExpired(error);
-  handleUnauthorized(res.status, error);
+  handleUnauthorized(res.status, wasLoggedIn);
   return new Error(error.message ?? "An unexpected error occurred");
 }
 
