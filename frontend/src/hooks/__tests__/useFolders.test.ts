@@ -119,6 +119,44 @@ describe("useFolders", () => {
     expect(cached!.pages[0].messages[0].subject).toBe("Already cached");
   });
 
+  it("keeps an invalidated message cache entry stale", async () => {
+    mockApiGet.mockResolvedValue({
+      folders: [
+        {
+          name: "INBOX",
+          delimiter: "/",
+          attributes: [],
+          is_subscribed: true,
+          total_count: 5,
+          unread_count: 2,
+          recent_messages: [{ ...mockMessage, subject: "Newer from folders" }],
+        },
+      ],
+    });
+
+    const { queryClient, wrapper } = createWrapper();
+    queryClient.setDefaultOptions({ queries: { retry: false, staleTime: 60_000 } });
+
+    // A cached list for a folder nobody is viewing, then new mail arrives
+    // and the WebSocket handler invalidates it.
+    const existing: InfiniteData<MessagesResponse> = {
+      pages: [{ messages: [{ ...mockMessage, subject: "Already cached" }], total_count: 5, page: 0, per_page: 50, syncing: false }],
+      pageParams: [0],
+    };
+    queryClient.setQueryData(["messages", "INBOX"], existing);
+    await queryClient.invalidateQueries({ queryKey: ["messages", "INBOX"] });
+    const updatedBefore = queryClient.getQueryState(["messages", "INBOX"])!.dataUpdatedAt;
+
+    const { result } = renderHook(() => useFolders(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The folder-list refetch must not mark the old list fresh again, or
+    // opening the folder shows it without refetching.
+    const state = queryClient.getQueryState(["messages", "INBOX"])!;
+    expect(state.isInvalidated).toBe(true);
+    expect(state.dataUpdatedAt).toBe(updatedBefore);
+  });
+
   it("skips folders with no recent messages", async () => {
     mockApiGet.mockResolvedValue({
       folders: [
