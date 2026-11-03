@@ -24,10 +24,18 @@ interface WebSocketMessage {
   event: MailEvent;
 }
 
+/** Hidden for at least this long, the page may have missed pushed events. */
+const RESUME_REFRESH_AFTER_MS = 30_000;
+
 /**
  * Connects to the backend WebSocket endpoint for real-time mail events.
  * Automatically reconnects with exponential backoff on disconnect.
  * Invalidates React Query caches when events arrive.
+ *
+ * Events sent while the socket was down are lost, so after a reconnect, or
+ * when the page comes back from the background (sleep, mobile tab switch),
+ * mail data is refetched. Coming back online or visible reconnects at once
+ * instead of waiting out the backoff.
  */
 export function useWebSocket(onEvent?: (event: MailEvent) => void) {
   const queryClient = useQueryClient();
@@ -66,6 +74,15 @@ export function useWebSocket(onEvent?: (event: MailEvent) => void) {
 
   useEffect(() => {
     mountedRef.current = true;
+    // Set once a connection is lost; the next successful open refetches.
+    let missedEvents = false;
+    let hiddenSince: number | null = null;
+
+    const refreshMail = () => {
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      queryClient.invalidateQueries({ queryKey: ["outbox"] });
+    };
 
     const connect = () => {
       if (!mountedRef.current) return;
@@ -82,6 +99,10 @@ export function useWebSocket(onEvent?: (event: MailEvent) => void) {
         setStatus("connected");
         setFailCount(0);
         backoffRef.current = 1000; // Reset backoff on successful connect
+        if (missedEvents) {
+          missedEvents = false;
+          refreshMail();
+        }
       };
 
       ws.onmessage = (event) => {
@@ -127,7 +148,8 @@ export function useWebSocket(onEvent?: (event: MailEvent) => void) {
       };
 
       ws.onclose = () => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || wsRef.current !== ws) return;
+        missedEvents = true;
         setStatus("disconnected");
         setFailCount((c) => c + 1);
         wsRef.current = null;
@@ -146,7 +168,37 @@ export function useWebSocket(onEvent?: (event: MailEvent) => void) {
     connectRef.current = connect;
     connect();
 
+    // Skip the backoff wait when the page is usable again.
+    const reconnectNow = () => {
+      if (wsRef.current || !navigator.onLine) return;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      backoffRef.current = 1000;
+      connect();
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        hiddenSince = Date.now();
+        return;
+      }
+      // An open socket can still have missed events while the page was
+      // suspended, so refetch after a long absence either way.
+      if (hiddenSince !== null && Date.now() - hiddenSince >= RESUME_REFRESH_AFTER_MS) {
+        refreshMail();
+      }
+      hiddenSince = null;
+      reconnectNow();
+    };
+
+    window.addEventListener("online", reconnectNow);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
     return () => {
+      window.removeEventListener("online", reconnectNow);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       mountedRef.current = false;
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
