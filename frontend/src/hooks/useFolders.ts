@@ -24,9 +24,14 @@ export function useFolders() {
         queryClient.setQueryData<InfiniteData<MessagesResponse>>(
           ["messages", folder.name],
           (existing) => {
-            // Don't overwrite a cache entry that's already been populated by
-            // a real messages fetch (which may have fresher or more data).
-            if (existing) return existing;
+            // Don't touch a cache entry that's already been populated by a
+            // real messages fetch (which may have fresher or more data).
+            // Return undefined, not `existing`: setQueryData always records
+            // a write, which would clear an invalidation (e.g. from a
+            // FolderStateChanged event for new mail) and mark the old list
+            // fresh for staleTime, so opening the folder would show it
+            // without refetching. Undefined makes setQueryData a no-op.
+            if (existing) return undefined;
             return {
               pages: [
                 {
