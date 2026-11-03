@@ -315,6 +315,7 @@ function FolderItem({
   const openMenuRef = useRef<((pos: { x: number; y: number }) => void) | null>(null);
   const activeFolder = useUiStore((s) => s.activeFolder);
   const setActiveFolder = useUiStore((s) => s.setActiveFolder);
+  const clearSearch = useUiStore((s) => s.clearSearch);
   const shouldAnimate = useUiStore((s) => s.effectiveAnimationMode) !== "off";
   const isActive = activeFolder === folder.name;
   const isFetching = useIsFetching({ queryKey: ["messages", folder.name] });
@@ -438,7 +439,11 @@ function FolderItem({
       <button
         type="button"
         onClick={() => {
-          if (!isNoSelect) setActiveFolder(folder.name);
+          if (isNoSelect) return;
+          // Search results span all folders and stay on screen while a
+          // search is active; picking a folder means showing that folder.
+          clearSearch();
+          setActiveFolder(folder.name);
         }}
         aria-current={isActive ? "page" : undefined}
         className={cn(
