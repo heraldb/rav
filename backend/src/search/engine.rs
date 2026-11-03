@@ -215,14 +215,20 @@ impl UserIndex {
     }
 
     /// Delete a message from the index by uid and folder.
-    #[allow(dead_code)]
     pub fn delete_message(&self, uid: u32, folder: &str) -> Result<(), String> {
+        self.delete_messages(folder, &[uid])
+    }
+
+    /// Delete several messages of one folder from the index in a single commit.
+    pub fn delete_messages(&self, folder: &str, uids: &[u32]) -> Result<(), String> {
         let mut writer: IndexWriter = self
             .index
             .writer(15_000_000)
             .map_err(|e| format!("Failed to create index writer: {e}"))?;
 
-        self.delete_existing(&mut writer, uid, folder);
+        for uid in uids {
+            self.delete_existing(&mut writer, *uid, folder);
+        }
 
         writer
             .commit()

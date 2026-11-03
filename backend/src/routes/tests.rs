@@ -173,6 +173,41 @@
         ))
     }
 
+    /// Helper: index messages whose body text is "needle".
+    fn index_needles(data_dir: &str, user_hash: &str, folder: &str, uids: &[u32]) {
+        let index = test_search_engine(data_dir).open_user_index(user_hash).unwrap();
+        let messages: Vec<_> = uids
+            .iter()
+            .map(|&uid| crate::search::engine::IndexableMessage {
+                uid,
+                folder: folder.to_string(),
+                subject: "Test".into(),
+                from_address: "a@b.com".into(),
+                from_name: "A".into(),
+                to_addresses: "[]".into(),
+                body_text: "needle".into(),
+                date_epoch: 0,
+                has_attachments: false,
+            })
+            .collect();
+        index.index_messages_batch(&messages).unwrap();
+    }
+
+    /// Helper: sorted (folder, uid) of every indexed message matching "needle".
+    fn needle_hits(data_dir: &str, user_hash: &str) -> Vec<(String, u32)> {
+        let index = test_search_engine(data_dir).open_user_index(user_hash).unwrap();
+        let (results, _) = index
+            .search(&crate::search::engine::SearchQuery {
+                text: "needle".into(),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut hits: Vec<_> = results.into_iter().map(|r| (r.folder, r.uid)).collect();
+        hits.sort();
+        hits
+    }
+
     /// Helper: create a test EventBus.
     fn test_event_bus() -> Arc<crate::realtime::events::EventBus> {
         Arc::new(crate::realtime::events::EventBus::new())
@@ -1386,6 +1421,7 @@
         crate::db::messages::upsert_message(&conn, "INBOX", 42, UpsertMessageParams { message_id: None, in_reply_to: None, references_header: None, subject: "Test", from_address: "a@b.com", from_name: "A", to_json: "[]", cc_json: "[]", date: "2024-01-01", date_epoch: 0, flags_csv: "", size: 0, has_attachments: false, snippet: "", reaction: None })
         .unwrap();
         drop(conn);
+        index_needles(data_dir.path().to_str().unwrap(), &user_hash, "INBOX", &[42, 43]);
 
         let mock = MockImapClient::new();
         let imap_client: Arc<dyn ImapClient> = Arc::new(mock);
@@ -1406,6 +1442,11 @@
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        // The moved message left the index; the other one stayed.
+        assert_eq!(
+            needle_hits(data_dir.path().to_str().unwrap(), &user_hash),
+            vec![("INBOX".to_string(), 43)]
+        );
     }
 
     #[tokio::test]
@@ -1434,6 +1475,7 @@
         crate::db::messages::upsert_message(&conn, "INBOX", 7, UpsertMessageParams { message_id: None, in_reply_to: None, references_header: None, subject: "Test", from_address: "a@b.com", from_name: "A", to_json: "[]", cc_json: "[]", date: "2024-01-01", date_epoch: 0, flags_csv: "", size: 0, has_attachments: false, snippet: "", reaction: None })
         .unwrap();
         drop(conn);
+        index_needles(data_dir.path().to_str().unwrap(), &user_hash, "INBOX", &[7, 8]);
 
         let mock = MockImapClient::new();
         let imap_client: Arc<dyn ImapClient> = Arc::new(mock);
@@ -1452,6 +1494,11 @@
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        // The deleted message left the index; the other one stayed.
+        assert_eq!(
+            needle_hits(data_dir.path().to_str().unwrap(), &user_hash),
+            vec![("INBOX".to_string(), 8)]
+        );
     }
 
     /// Seeds two messages (uids 1 and 2) in `folder` and returns the app + encrypted folder id.
@@ -1675,6 +1722,8 @@
             .unwrap();
         drop(conn);
 
+        index_needles(data_dir.path().to_str().unwrap(), &user_hash, "INBOX", &[1, 2]);
+
         let move_body = format!(
             r#"{{"from_folder":"{inbox_id}","to_folder":"{archive_id}","uids":[1,999]}}"#
         );
@@ -1706,6 +1755,11 @@
             .query_row("SELECT COUNT(*) FROM messages WHERE folder='INBOX' AND uid=2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(untouched, 1);
+        drop(conn);
+        assert_eq!(
+            needle_hits(data_dir.path().to_str().unwrap(), &user_hash),
+            vec![("INBOX".to_string(), 2)]
+        );
     }
 
     #[tokio::test]
@@ -1774,6 +1828,7 @@
         let data_dir = TempDir::new().unwrap();
         let (app, folder_id, browser_id, account_id, token, user_hash) =
             setup_bulk_test_messages(&data_dir, "INBOX");
+        index_needles(data_dir.path().to_str().unwrap(), &user_hash, "INBOX", &[1, 2]);
 
         let mut req = Request::builder()
             .method("POST")
@@ -1802,6 +1857,11 @@
             .query_row("SELECT COUNT(*) FROM messages WHERE folder='INBOX' AND uid=2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(uid2_untouched, 1);
+        drop(conn);
+        assert_eq!(
+            needle_hits(data_dir.path().to_str().unwrap(), &user_hash),
+            vec![("INBOX".to_string(), 2)]
+        );
     }
 
     #[tokio::test]

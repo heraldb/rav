@@ -958,15 +958,46 @@ pub async fn bulk_update_flags(
     Ok(Json(BulkMessageOpResponse { failed_uids }).into_response())
 }
 
+/// Remove messages that were moved or deleted from the search index.
+///
+/// Their cache rows are gone, so search already drops these hits, but nothing
+/// else would ever remove them: they would stay in the index for good and
+/// take up places in the ranked results that real matches should get. The
+/// destination copy of a moved message is indexed when that folder syncs.
+///
+/// Best-effort: the IMAP change already succeeded, so a failure here is only
+/// logged.
+async fn remove_from_search_index(
+    search_engine: &Arc<SearchEngine>,
+    user_hash: &str,
+    folder: &str,
+    uids: Vec<u32>,
+) {
+    if uids.is_empty() || UserIndex::is_excluded_folder(folder) {
+        return;
+    }
+    let search_engine = Arc::clone(search_engine);
+    let user_hash = user_hash.to_string();
+    let folder = folder.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        search_engine.open_user_index(&user_hash)?.delete_messages(&folder, &uids)
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        tracing::warn!(?result, "Failed to remove messages from search index");
+    }
+}
+
 /// `POST /api/messages/move`
 ///
 /// Moves a message from one folder to another on the IMAP server and
-/// removes it from the source folder in SQLite cache.
+/// removes it from the source folder in SQLite cache and search index.
 pub async fn move_message_handler(
     Extension(session): Extension<SessionState>,
     Extension(config): Extension<Arc<AppConfig>>,
     Extension(imap_client): Extension<Arc<dyn ImapClient>>,
     Extension(db_pool_manager): Extension<Arc<db::pool::DbPoolManager>>,
+    Extension(search_engine): Extension<Arc<SearchEngine>>,
     Json(body): Json<MoveMessageRequest>,
 ) -> Result<Response, AppError> {
     let cipher = cipher_for(&session);
@@ -979,6 +1010,8 @@ pub async fn move_message_handler(
         .move_message(&creds, &from_folder, body.uid, &to_folder)
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("IMAP error: {e}")))?;
+
+    remove_from_search_index(&search_engine, &session.user_hash, &from_folder, vec![body.uid]).await;
 
     db::pool::with_user_db(&db_pool_manager, &session.user_hash, move |conn| {
         // Check if the message was unread before removing it from the source
@@ -1021,6 +1054,7 @@ pub async fn bulk_move_messages(
     Extension(config): Extension<Arc<AppConfig>>,
     Extension(imap_client): Extension<Arc<dyn ImapClient>>,
     Extension(db_pool_manager): Extension<Arc<db::pool::DbPoolManager>>,
+    Extension(search_engine): Extension<Arc<SearchEngine>>,
     Json(body): Json<BulkMoveMessagesRequest>,
 ) -> Result<Response, AppError> {
     let cipher = cipher_for(&session);
@@ -1040,6 +1074,8 @@ pub async fn bulk_move_messages(
         .move_message_bulk(&creds, &from_folder, &body.uids, &to_folder)
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("IMAP error: {e}")))?;
+
+    remove_from_search_index(&search_engine, &session.user_hash, &from_folder, body.uids.clone()).await;
 
     let uids = body.uids.clone();
     let failed_uids = db::pool::with_user_db(&db_pool_manager, &session.user_hash, move |conn| {
@@ -1169,12 +1205,14 @@ pub async fn download_attachment(
 
 /// `DELETE /api/messages/:folder/:uid`
 ///
-/// Permanently removes a message from the IMAP server and SQLite cache.
+/// Permanently removes a message from the IMAP server, SQLite cache and
+/// search index.
 pub async fn delete_message_handler(
     Extension(session): Extension<SessionState>,
     Extension(config): Extension<Arc<AppConfig>>,
     Extension(imap_client): Extension<Arc<dyn ImapClient>>,
     Extension(db_pool_manager): Extension<Arc<db::pool::DbPoolManager>>,
+    Extension(search_engine): Extension<Arc<SearchEngine>>,
     Path((folder_id, uid)): Path<(FolderId, u32)>,
 ) -> Result<Response, AppError> {
     let folder = cipher_for(&session).decrypt(&folder_id)?;
@@ -1185,6 +1223,8 @@ pub async fn delete_message_handler(
         .expunge_message(&creds, &folder, uid)
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("IMAP error: {e}")))?;
+
+    remove_from_search_index(&search_engine, &session.user_hash, &folder, vec![uid]).await;
 
     // Delete from SQLite cache.
     db::pool::with_user_db(&db_pool_manager, &session.user_hash, move |conn| {
@@ -1209,6 +1249,7 @@ pub async fn bulk_delete_messages(
     Extension(config): Extension<Arc<AppConfig>>,
     Extension(imap_client): Extension<Arc<dyn ImapClient>>,
     Extension(db_pool_manager): Extension<Arc<db::pool::DbPoolManager>>,
+    Extension(search_engine): Extension<Arc<SearchEngine>>,
     Path(folder_id): Path<FolderId>,
     Json(body): Json<BulkDeleteMessagesRequest>,
 ) -> Result<Response, AppError> {
@@ -1227,6 +1268,8 @@ pub async fn bulk_delete_messages(
         .expunge_message_bulk(&creds, &folder, &body.uids)
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("IMAP error: {e}")))?;
+
+    remove_from_search_index(&search_engine, &session.user_hash, &folder, body.uids.clone()).await;
 
     let uids = body.uids.clone();
     let failed_uids = db::pool::with_user_db(&db_pool_manager, &session.user_hash, move |conn| {
