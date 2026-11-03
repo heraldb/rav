@@ -23,3 +23,4 @@ fix/folder-click-clears-search
 fix/preview-pdf-sent-as-octet-stream
 fix/search-input-name
 fix/redirect-to-login-on-expired-session
+fix/folder-list-keeps-stale-mark
