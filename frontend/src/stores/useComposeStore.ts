@@ -104,6 +104,10 @@ export function injectSignature(body: string, signatureHtml: string): string {
   const sigBlock = wrapSignatureHtml(signatureHtml);
   if (!sigBlock) return body;
 
+  // Leave an empty line above the signature to type in; otherwise the
+  // cursor starts inside the signature block.
+  if (!body.trim()) body = "<p></p>";
+
   // Try to insert before blockquote (quoted reply/forward content)
   const bqIndex = body.indexOf("<blockquote");
   if (bqIndex !== -1) {
@@ -112,29 +116,33 @@ export function injectSignature(body: string, signatureHtml: string): string {
   return body + sigBlock;
 }
 
+/** The signature block of the body, ignoring signatures in quoted content. */
+function findSignature(doc: Document): Element | null {
+  const blocks = Array.from(doc.querySelectorAll('[data-signature="true"]'));
+  return blocks.find((block) => !block.closest("blockquote")) ?? null;
+}
+
 /** Replaces or removes the signature block in the body HTML. */
 export function replaceSignatureInBody(body: string, newSignatureHtml: string): string {
-  const sigRegex = /<div class="email-signature"[^>]*>[\s\S]*?<\/div>/;
-  const newSigBlock = wrapSignatureHtml(newSignatureHtml);
-
-  if (sigRegex.test(body)) {
-    if (newSigBlock) {
-      return body.replace(sigRegex, newSigBlock);
-    }
-    // Remove the signature block
-    return body.replace(sigRegex, "");
-  }
+  const doc = new DOMParser().parseFromString(body, "text/html");
+  const existing = findSignature(doc);
 
   // No existing signature — inject if we have one
-  if (newSigBlock) {
-    return injectSignature(body, newSignatureHtml);
+  if (!existing) {
+    return newSignatureHtml ? injectSignature(body, newSignatureHtml) : body;
   }
-  return body;
+
+  if (newSignatureHtml) {
+    existing.outerHTML = wrapSignatureHtml(newSignatureHtml);
+  } else {
+    existing.remove();
+  }
+  return doc.body.innerHTML;
 }
 
 /** Removes the signature block from the body HTML. */
 export function removeSignatureFromBody(body: string): string {
-  return body.replace(/<div class="email-signature"[^>]*>[\s\S]*?<\/div>/, "");
+  return replaceSignatureInBody(body, "");
 }
 
 /** Visible text (without whitespace) and image sources of an HTML fragment. */
