@@ -189,6 +189,26 @@ pub fn update_folder_sync_status(
     Ok(())
 }
 
+/// Record a folder's UIDVALIDITY and message count from the server without
+/// touching its messages cache state. Unlike `update_folder_sync_status`,
+/// this neither marks the cache fresh nor stores `highest_modseq`: use it
+/// when the folder's messages were not reconciled. A stored modseq would make
+/// the next sync take the CONDSTORE path, which fetches everything above the
+/// cached maximum UID.
+pub fn update_folder_server_counts(
+    conn: &Connection,
+    name: &str,
+    uid_validity: u32,
+    total_count: u32,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE folders SET uid_validity = ?1, total_count = ?2 WHERE name = ?3",
+        params![uid_validity, total_count, name],
+    )
+    .map_err(|e| format!("Failed to update folder server counts: {e}"))?;
+    Ok(())
+}
+
 /// Recompute and store the unread count for a folder from the messages table.
 pub fn refresh_unread_count(conn: &Connection, folder_name: &str) -> Result<(), String> {
     let unread: u32 = conn
