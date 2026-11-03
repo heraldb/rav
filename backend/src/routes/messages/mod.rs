@@ -582,6 +582,9 @@ pub async fn get_message(
         .map_err(|e| AppError::InternalError(format!("Database error: {e}")))?
     };
 
+    // A cached body was indexed when it was fetched (below, or by the sync's
+    // deep-index phase), so only a freshly fetched one needs indexing.
+    let fetched_body = matches!(outcome, CachedBodyOutcome::NeedsFetch);
     let BodyData { body_html, body_text, attachments, raw_headers, email_theme, pgp_status } = match outcome {
         CachedBodyOutcome::Ready(data) => *data,
         CachedBodyOutcome::NeedsFetch => {
@@ -704,11 +707,12 @@ pub async fn get_message(
         .map_err(|e| AppError::InternalError(format!("Database error: {e}")))?
     };
 
-    // Re-index message with full body text for search.
-    // Skip indexing for Spam/Junk/Trash folders.
-    if let Some(ref text) = body_text
+    // Re-index message with full body text for search, off the async
+    // runtime: an index commit is blocking disk work, and the response
+    // doesn't depend on it. Skip indexing for Spam/Junk/Trash folders.
+    if fetched_body
+        && let Some(ref text) = body_text
         && !UserIndex::is_excluded_folder(&folder)
-        && let Ok(user_index) = search_engine.open_user_index(&session.user_hash)
     {
         let indexable = IndexableMessage {
             uid: msg.uid,
@@ -721,7 +725,13 @@ pub async fn get_message(
             date_epoch: msg.date_epoch,
             has_attachments: msg.has_attachments,
         };
-        let _ = user_index.index_message(&indexable);
+        let search_engine = Arc::clone(&search_engine);
+        let user_hash = session.user_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(user_index) = search_engine.open_user_index(&user_hash) {
+                let _ = user_index.index_message(&indexable);
+            }
+        });
     }
 
     let resp_cipher = cipher_for(&session);
